@@ -2,15 +2,19 @@
 
 基于 FastAPI 的用量复核服务：输入一组带秒精度 UTC 时间戳的累计水表读数、计数器模数与每秒最大计数增量，对每段相邻读数判定满足**非负增量**与**速率上限**的整圈回绕次数是否唯一。唯一时返回分段用量与总用量；无解或多解时返回出错区间与原因，**不猜测圈数**。
 
+此外提供**账单总量对账**接口：在同一组非负增量与速率上限约束下，额外接收账单总用量，以整数区间运算收紧各段仍可行的回绕次数范围；只有圈数被唯一确定的段才给出用量，其余段仅返回范围，冲突时给出明确原因。
+
 ## 快速启动（Docker，一键）
 
 ```bash
 docker compose up --build
 ```
 
-依赖在镜像构建时自动安装，无需本地环境。启动后：
+依赖在镜像构建时自动安装，无需本地环境。启动后（默认监听宿主机 **8000** 端口）：
 
 - API 地址：`http://localhost:8000`
+- 用量复核：`POST http://localhost:8000/v1/usage/verify`
+- 账单总量对账：`POST http://localhost:8000/v1/usage/reconcile`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 - 健康检查：`http://localhost:8000/health`
 
@@ -114,6 +118,125 @@ pytest
 
 **请求校验失败（`422`）**：时间戳未严格递增、缺时区、含亚秒、读数越界、参数非法等，返回 FastAPI 标准错误明细。
 
+### `POST /v1/usage/reconcile`
+
+账单总量对账。请求体在复核接口字段基础上增加 `total_usage`（非负整数账单总用量），读数、模数、速率等校验与 `/v1/usage/verify` 完全一致。
+
+**请求体**
+
+```json
+{
+  "modulus": 1000,
+  "max_rate_per_second": 10,
+  "total_usage": 5000,
+  "readings": [
+    { "timestamp": "2026-09-24T00:00:00Z", "value": 100 },
+    { "timestamp": "2026-09-24T00:16:40Z", "value": 200 },
+    { "timestamp": "2026-09-24T00:33:20Z", "value": 100 }
+  ]
+}
+```
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `total_usage` | 整数 | `>= 0`，账单总用量（非负整数） |
+| 其余字段 | — | 与 `/v1/usage/verify` 相同 |
+
+**响应（账单可行，`200`，`status = "ok"`）**
+
+```json
+{
+  "status": "ok",
+  "modulus": 1000,
+  "total_usage": 5000,
+  "total_wraps": 5,
+  "segments": [
+    {
+      "index": 0,
+      "start_timestamp": "2026-09-24T00:00:00Z",
+      "end_timestamp": "2026-09-24T00:16:40Z",
+      "start_reading": 100,
+      "end_reading": 200,
+      "elapsed_seconds": 1000,
+      "min_wraps": 0,
+      "max_wraps": 4,
+      "wraps": null,
+      "usage": null,
+      "min_usage": 100,
+      "max_usage": 4100
+    },
+    {
+      "index": 1,
+      "start_timestamp": "2026-09-24T00:16:40Z",
+      "end_timestamp": "2026-09-24T00:33:20Z",
+      "start_reading": 200,
+      "end_reading": 100,
+      "elapsed_seconds": 1000,
+      "min_wraps": 1,
+      "max_wraps": 5,
+      "wraps": null,
+      "usage": null,
+      "min_usage": 900,
+      "max_usage": 4900
+    }
+  ],
+  "conflicts": []
+}
+```
+
+当某段收紧后圈数唯一（`min_wraps == max_wraps`），`wraps` 与 `usage` 给出确定值，`min_usage` / `max_usage` 为 `null`；仍有多解的段反之，**只给范围不猜测**。所有段确定用量之和恒等于 `total_usage`。
+
+**响应（冲突，`200`，`status = "conflict"`）**
+
+分段原本无解时：
+
+```json
+{
+  "status": "conflict",
+  "modulus": 1000,
+  "total_usage": 300,
+  "total_wraps": null,
+  "segments": [],
+  "conflicts": [
+    {
+      "kind": "segment",
+      "index": 1,
+      "start_timestamp": "2026-09-24T00:00:10Z",
+      "end_timestamp": "2026-09-24T00:00:11Z",
+      "start_reading": 300,
+      "end_reading": 900,
+      "elapsed_seconds": 1,
+      "reason": "no_solution",
+      "detail": "无解：最可能增量 600 已超出该区间 1s 内允许的最大增量 20（k 需同时满足 k>=0 与 k<=-1，区间为空）",
+      "min_wraps": 0,
+      "max_wraps": -1
+    }
+  ]
+}
+```
+
+账单总量不相容或超界时（`kind = "total"`）：
+
+```json
+{
+  "kind": "total",
+  "reason": "total_incompatible_modulus",
+  "detail": "账单总量与模数不相容：总量 B 必须满足 B ≡ 0 (mod 1000)（首尾读数差为 0），收到 5500（余数 500），总回绕次数不是整数",
+  "feasible_min_total": 1000,
+  "feasible_max_total": 19000,
+  "expected_remainder": 0,
+  "total_wraps": null
+}
+```
+
+冲突原因：
+
+- `kind = "segment"`，`reason = "no_solution"`：某段在非负增量/速率上限下原本无解（复用复核接口的逐段判定）。
+- `kind = "total"`，`reason = "total_incompatible_modulus"`：账单总量与首尾读数差模 `modulus` 不同余，总回绕次数不是整数；`expected_remainder` 给出应有的余数。
+- `kind = "total"`，`reason = "total_out_of_range"`：总回绕次数超出各段可行圈数之和 `[Σk_min, Σk_max]`，即可行账单总量不在 `[feasible_min_total, feasible_max_total]` 内。
+
+存在分段无解冲突时不再进行总量推断；总量冲突时 `segments` 为空。`total_usage` 为负数或非整数等请求校验错误返回 `422`。
+
 ## 判定规则
 
 对每段相邻读数 `(r1, t1) -> (r2, t2)`，真实增量为 `delta = (r2 - r1) + k * modulus`，其中 `k >= 0` 为整圈回绕次数。约束：
@@ -126,6 +249,28 @@ pytest
 - `k_max < k_min` → 无解（`no_solution`）
 - `k_max == k_min` → 唯一解，取该 `k` 计算用量
 - `k_max > k_min` → 多解（`ambiguous`），不猜测圈数
+
+### 账单总量对账
+
+设账单总用量为 `B`。各段增量望远镜相消，总量恒等式为：
+
+```
+B = Σ delta_i = (r_last - r_first) + modulus * K
+```
+
+其中 `K = Σ k_i` 为整条序列的回绕次数总和。因此：
+
+1. `B - (r_last - r_first)` 必须为 `modulus` 的非负整数倍，否则账单总量与模数不相容（`total_incompatible_modulus`）；
+2. `K` 必须落在 `[Σ k_min, Σ k_max]` 内，否则超出可行总量（`total_out_of_range`，可行总量区间随之给出）。
+
+固定 `K` 后，由「其余各段圈数之和 = `K - k_i`」的区间和直接反推每段仍可行的圈数范围（**整数区间运算，不枚举组合**）：
+
+```
+lo_i' = max(k_min_i, K - Σ_{j≠i} k_max_j)
+hi_i' = min(k_max_i, K - Σ_{j≠i} k_min_j)
+```
+
+`lo_i' == hi_i'` 的段圈数唯一、确定用量；其余段返回 `[lo_i', hi_i']` 及对应用量范围，不做猜测。
 
 ## 项目结构
 
