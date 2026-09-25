@@ -1,11 +1,11 @@
-"""累计水表读数用量复核 API。"""
+"""累计水表读数用量复核与账单总量对账 API。"""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from decimal import Decimal
 from fractions import Fraction
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Tuple
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -14,13 +14,19 @@ from app.core import (
     STATUS_AMBIGUOUS,
     STATUS_NO_SOLUTION,
     STATUS_OK,
+    SegmentSolution,
+    reconcile_bill_total,
     solve_segment,
 )
 
 app = FastAPI(
     title="Water Meter Usage Verifier",
-    version="1.0.0",
-    description="累计水表读数用量复核：判定相邻读数间的整圈回绕次数是否唯一，唯一时给出分段与总用量。",
+    version="1.1.0",
+    description=(
+        "累计水表读数用量复核：判定相邻读数间的整圈回绕次数是否唯一，唯一时给出分段与总用量；"
+        "账单总量对账：以首尾读数差与账单总用量约束整条序列的回绕次数总和，"
+        "收紧各段可行圈数范围，仅对圈数唯一的区间给出用量。"
+    ),
 )
 
 
@@ -71,6 +77,12 @@ class VerifyRequest(BaseModel):
         return self
 
 
+class ReconcileRequest(VerifyRequest):
+    """账单总量对账请求：复用读数、模数与速率校验，附加账单总用量。"""
+
+    billed_total: int = Field(ge=0, description="账单总用量（非负整数）")
+
+
 # ---------------------------------------------------------------------------
 # 响应模型
 # ---------------------------------------------------------------------------
@@ -106,6 +118,43 @@ class VerifyResponse(BaseModel):
     errors: List[SegmentErrorOut] = Field(description="无解或多解的出错区间")
     total_usage: Optional[int] = Field(
         description="全部区间唯一时的总用量；存在出错区间时为 null"
+    )
+
+
+class ReconcileSegmentOut(BaseModel):
+    index: int
+    start_timestamp: datetime
+    end_timestamp: datetime
+    start_reading: int
+    end_reading: int
+    elapsed_seconds: int
+    wraps: Optional[int] = Field(description="对账后圈数唯一时填充；否则为 null")
+    usage: Optional[int] = Field(description="圈数唯一时的该段用量；否则为 null")
+    min_wraps: int = Field(description="对账后仍可行的最小回绕次数")
+    max_wraps: int = Field(description="对账后仍可行的最大回绕次数")
+
+
+class ReconcileErrorOut(BaseModel):
+    reason: Literal["segment_no_solution", "incompatible_total", "total_out_of_range"]
+    detail: str
+    index: Optional[int] = Field(
+        default=None, description="segment_no_solution 时的出错区间序号"
+    )
+
+
+class ReconcileResponse(BaseModel):
+    status: Literal["ok", "error"]
+    modulus: int
+    billed_total: int
+    required_total_wraps: Optional[int] = Field(
+        description="由首尾读数差与账单总量推出的总回绕次数 K；账单与模数不相容时为 null"
+    )
+    segments: List[ReconcileSegmentOut] = Field(
+        description="对账通过时各段收紧后的可行圈数范围；冲突时为空"
+    )
+    errors: List[ReconcileErrorOut] = Field(description="冲突原因；对账通过时为空")
+    total_usage: Optional[int] = Field(
+        description="对账通过时等于 billed_total；冲突时为 null"
     )
 
 
@@ -180,4 +229,75 @@ def verify_usage(req: VerifyRequest) -> VerifyResponse:
         segments=segments,
         errors=errors,
         total_usage=None if has_error else sum(s.usage for s in segments),
+    )
+
+
+@app.post("/v1/usage/reconcile", response_model=ReconcileResponse)
+def reconcile_usage(req: ReconcileRequest) -> ReconcileResponse:
+    # Decimal -> Fraction 为精确转换，速率上限不产生浮点误差
+    max_rate = Fraction(req.max_rate_per_second)
+
+    solved: List[Tuple[Reading, Reading, int, SegmentSolution]] = []
+    for i, (a, b) in enumerate(zip(req.readings, req.readings[1:])):
+        elapsed = int((b.timestamp - a.timestamp).total_seconds())
+        sol = solve_segment(i, a.value, b.value, elapsed, req.modulus, max_rate)
+        solved.append((a, b, elapsed, sol))
+
+    reading_span = req.readings[-1].value - req.readings[0].value
+    result = reconcile_bill_total(
+        [sol for _, _, _, sol in solved],
+        req.modulus,
+        req.billed_total,
+        reading_span,
+    )
+
+    if not result.feasible:
+        return ReconcileResponse(
+            status="error",
+            modulus=req.modulus,
+            billed_total=req.billed_total,
+            required_total_wraps=result.required_total_wraps,
+            segments=[],
+            errors=[
+                ReconcileErrorOut(
+                    reason=c.reason,  # type: ignore[arg-type]
+                    detail=c.detail,
+                    index=c.index,
+                )
+                for c in result.conflicts
+            ],
+            total_usage=None,
+        )
+
+    segments: List[ReconcileSegmentOut] = []
+    for (a, b, elapsed, sol), (lo, hi) in zip(solved, result.ranges or ()):
+        if lo == hi:
+            wraps: Optional[int] = lo
+            usage: Optional[int] = (b.value - a.value) + lo * req.modulus
+        else:
+            wraps = None
+            usage = None
+        segments.append(
+            ReconcileSegmentOut(
+                index=sol.index,
+                start_timestamp=a.timestamp,
+                end_timestamp=b.timestamp,
+                start_reading=a.value,
+                end_reading=b.value,
+                elapsed_seconds=elapsed,
+                wraps=wraps,
+                usage=usage,
+                min_wraps=lo,
+                max_wraps=hi,
+            )
+        )
+
+    return ReconcileResponse(
+        status="ok",
+        modulus=req.modulus,
+        billed_total=req.billed_total,
+        required_total_wraps=result.required_total_wraps,
+        segments=segments,
+        errors=[],
+        total_usage=req.billed_total,
     )
